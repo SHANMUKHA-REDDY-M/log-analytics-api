@@ -50,12 +50,8 @@ async def _archive() -> int:
                     )
 
             client = _s3_client()
-            await asyncio.to_thread(
-                client.upload_file, filename, bucket, object_name
-            )
-            await session.execute(
-                delete(LogRecord).where(LogRecord.timestamp < cutoff)
-            )
+            await asyncio.to_thread(client.upload_file, filename, bucket, object_name)
+            await session.execute(delete(LogRecord).where(LogRecord.timestamp < cutoff))
             await session.commit()
             return len(records)
         finally:
