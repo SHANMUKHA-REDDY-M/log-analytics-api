@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: log-analytics-migrate-REPLACE_IMAGE_TAG
+  namespace: default
+  labels:
+    app: log-analytics-migrations
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: log-analytics-migrations
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrations
+          image: REPLACE_ECR_REGISTRY/log-analytics-api:REPLACE_IMAGE_TAG
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: log-analytics-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

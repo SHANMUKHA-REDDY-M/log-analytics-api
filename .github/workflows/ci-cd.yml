@@ -1,0 +1,134 @@
+name: Enterprise EKS Deployment Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY_API: log-analytics-api
+  ECR_REPOSITORY_FRONTEND: log-frontend
+  EKS_CLUSTER_NAME: log-analytics-prod
+  IAM_ROLE_ARN: arn:aws:iam::REPLACE_ACCOUNT_ID:role/GitHubActionsEKSRole
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: adminpassword
+          POSTGRES_DB: logsdb_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U admin -d logsdb_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx black flake8
+      - name: Check formatting
+        run: black --check app/ tests/
+      - name: Lint
+        run: flake8 app/ tests/ --max-line-length=88
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://admin:adminpassword@localhost:5432/logsdb_test
+        run: alembic upgrade head
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://admin:adminpassword@localhost:5432/logsdb_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/ -v --disable-warnings
+      - name: Build frontend
+        run: |
+          npm ci --prefix log-dashboard
+          npm run build --prefix log-dashboard
+
+  build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push immutable images
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build --pull -t "$REGISTRY/$ECR_REPOSITORY_API:$TAG" .
+          docker push "$REGISTRY/$ECR_REPOSITORY_API:$TAG"
+          docker build --pull -t "$REGISTRY/$ECR_REPOSITORY_FRONTEND:$TAG" ./log-dashboard
+          docker push "$REGISTRY/$ECR_REPOSITORY_FRONTEND:$TAG"
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Configure cluster access
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - name: Render immutable image references
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          find k8s -type f -name '*.yaml' -print0 | xargs -0 sed -i \
+            -e "s|REPLACE_ECR_REGISTRY|$REGISTRY|g" \
+            -e "s|REPLACE_IMAGE_TAG|$TAG|g"
+      - name: Validate manifests
+        run: kubectl apply --dry-run=server -f k8s/
+      - name: Apply External Secrets configuration
+        run: kubectl apply -f k8s/1-external-secrets.yaml
+      - name: Wait for application secret
+        run: kubectl wait --for=jsonpath='{.data}' secret/log-analytics-secrets --timeout=180s
+      - name: Run database migration Job
+        run: |
+          kubectl delete job "log-analytics-migrate-$GITHUB_SHA" --ignore-not-found
+          kubectl apply -f k8s/6-migration-job.yaml
+          kubectl wait --for=condition=complete "job/log-analytics-migrate-$GITHUB_SHA" --timeout=300s
+      - name: Deploy workloads
+        run: |
+          kubectl apply -f k8s/2-api-deployment.yaml
+          kubectl apply -f k8s/3-celery-worker-deployment.yaml
+          kubectl apply -f k8s/4-frontend-deployment.yaml
+          kubectl apply -f k8s/5-network-policy.yaml
+          kubectl rollout status deployment/log-analytics-api --timeout=300s
+          kubectl rollout status deployment/log-analytics-worker --timeout=300s
+          kubectl rollout status deployment/log-analytics-frontend --timeout=300s

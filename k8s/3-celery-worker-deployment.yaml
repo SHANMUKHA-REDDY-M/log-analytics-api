@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-analytics-worker
+  namespace: default
+  labels:
+    app: log-analytics-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: log-analytics-worker
+  template:
+    metadata:
+      labels:
+        app: log-analytics-worker
+    spec:
+      terminationGracePeriodSeconds: 120
+      tolerations:
+        - key: lifecycle
+          operator: Equal
+          value: Ec2Spot
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: celery-worker
+          image: REPLACE_ECR_REGISTRY/log-analytics-api:REPLACE_IMAGE_TAG
+          command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO"]
+          envFrom:
+            - secretRef:
+                name: log-analytics-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: log-analytics-worker
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: log-analytics-worker

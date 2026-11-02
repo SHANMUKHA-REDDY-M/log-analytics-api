@@ -1,0 +1,29 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.DS_Store
+.mypy_cache/
+.ruff_cache/
+.secrets/
+.coverage
+htmlcov/
+
+# Node and frontend build output
+node_modules/
+dist/
+build/
+
+# Terraform generated state and working directory
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/tfplan.binary
+
+# Local IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
