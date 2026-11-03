@@ -21,7 +21,9 @@ Amazon ECR, External Secrets Operator, and GitHub Actions.
 - Redis-backed cross-process publish/subscribe for real-time updates.
 - Celery worker and beat configuration for asynchronous archival and cleanup.
 - RabbitMQ broker and Redis result backend support.
-- S3-compatible archival support, including local MinIO.
+- S3-compatible archival support. Local Compose uses Adobe S3Mock because the
+previously referenced MinIO images are no longer available from the configured
+registries.
 - OpenTelemetry integration for FastAPI, SQLAlchemy, Redis, and Celery.
 - Liveness, readiness, and database health endpoints.
 - Configurable CORS, service URLs, rate limits, and telemetry settings.
@@ -29,8 +31,8 @@ Amazon ECR, External Secrets Operator, and GitHub Actions.
 ### Frontend and local platform
 
 - React/Vite dashboard in [`log-dashboard/`](./log-dashboard/).
-- Docker Compose services for PostgreSQL, PgBouncer, Redis, RabbitMQ,
-  MinIO, Jaeger, Prometheus, Grafana, API, Celery, and the frontend.
+- Docker Compose services for PostgreSQL, PgBouncer, Redis, RabbitMQ, S3Mock,
+  Jaeger, Prometheus, Grafana, API, Celery, and the frontend.
 - [`stream_simulator.py`](./stream_simulator.py) for bounded or continuous local
   ingestion traffic.
 
@@ -78,6 +80,30 @@ configured and verified in your AWS/GitHub account:
 - The latest GitHub Actions run should be treated as the source of truth for
   CI status; inspect it before enabling required branch checks.
 - GitHub branch protection has not been configured automatically.
+
+## Deployment decision and current state
+
+The application is currently deployed locally with Docker Compose, not on AWS.
+An AWS EKS environment was provisioned temporarily during the deployment
+investigation, but it was intentionally destroyed before leaving it running.
+This was a cost-control decision: EKS worker nodes, NAT gateways, load
+balancers, public IPv4 addresses, and related storage can continue generating
+charges even when the application is not actively being used. The Terraform
+state bucket and lock table were also deleted after the teardown.
+
+This means:
+
+- The local application is available for development and demonstration.
+- No AWS EKS cluster, VPC, NAT gateway, or Terraform state backend from this
+  setup is currently active.
+- AWS deployment remains prepared in Terraform, Kubernetes, and GitHub Actions,
+  but it has not received a final production rollout verification.
+- Re-deploying to AWS requires a deliberate budget decision and should be
+  treated as a new provisioning operation.
+
+The local stack uses S3Mock at `http://localhost:9000` as an S3-compatible
+test service. It is not a replacement for production AWS S3 and should not be
+used to evaluate production durability, availability, or security.
 
 ## Repository layout
 
@@ -143,7 +169,7 @@ stream_simulator.py          Local ingestion traffic generator
    - Frontend: <http://localhost:3001>
    - RabbitMQ: <http://localhost:15672>
    - Flower: <http://localhost:5555>
-   - MinIO console: <http://localhost:9001>
+   - S3Mock endpoint: <http://localhost:9000>
    - Jaeger: <http://localhost:16686>
    - Grafana: <http://localhost:3000>
 
@@ -178,8 +204,8 @@ stream_simulator.py          Local ingestion traffic generator
    docker compose down
    ```
 
-   Add `-v` only when you intentionally want to delete local database and
-   MinIO volumes.
+      Add `-v` only when you intentionally want to delete local database and
+      S3Mock volumes.
 
 ## Validation
 
@@ -193,6 +219,15 @@ pytest tests/ -v --disable-warnings
 
 The API integration tests require PostgreSQL and Redis. Start the Compose stack
 first, or provide equivalent services and environment variables.
+
+At the time of this documentation update, the local runtime checks pass and
+the focused tests pass. The full local test run reports 6 passed and 1
+environment-sensitive failure in
+`tests/api/test_logs.py::test_search_logs_by_severity`. The failing run occurs
+when the async Redis client is cleaned up after its event loop has already
+closed (`RuntimeError: Event loop is closed`); the same test passes when run
+individually. This is a test-fixture/client lifecycle issue, not an API
+readiness failure, but it should be fixed before claiming a clean CI baseline.
 
 Build the frontend independently:
 
@@ -210,6 +245,11 @@ pytest tests/ -v --cov=app --cov-report=term-missing --cov-report=html
 The HTML report is written to `htmlcov/`, which is ignored by Git.
 
 ## Production deployment runbook
+
+This runbook provisions billable AWS resources. Do not start it unless the
+account has an approved budget and someone is responsible for monitoring and
+tearing down the environment. For a low-cost evaluation, use the local
+Compose quick start instead.
 
 The recommended order is:
 
@@ -393,6 +433,40 @@ Before exposing public traffic, also verify:
 - NetworkPolicy behavior from frontend, API, and worker pods.
 - Spot-node drain and graceful worker shutdown.
 
+### 9. Cost monitoring and teardown
+
+Before provisioning, create an AWS budget alert and enable cost notifications.
+During the evaluation, monitor:
+
+- EKS control-plane and worker-node charges.
+- NAT gateway hourly and data-processing charges.
+- Application load balancer and public IPv4 charges.
+- ECR storage, S3 storage/requests, CloudWatch logs, and data transfer.
+
+When the evaluation is finished, delete the application workloads first and
+then destroy the Terraform-managed infrastructure:
+
+```bash
+cd terraform
+terraform plan -destroy \
+  -var='state_bucket=YOUR_STATE_BUCKET' \
+  -out=destroy.plan
+terraform show destroy.plan
+terraform apply destroy.plan
+```
+
+After Terraform completes, verify that no EKS clusters, NAT gateways, load
+balancers, or public IPv4 addresses remain. Keep the versioned Terraform state
+bucket and DynamoDB lock table only if the environment will be recreated; if
+they are no longer needed, remove all object versions and delete both backend
+resources according to the organization's retention policy. Never delete
+shared resources that are not owned by this project.
+
+If the private EKS endpoint is used, retain a private runner or bastion only
+for the deployment window and remove it immediately afterward. Do not leave a
+bastion, NAT gateway, or load balancer running just to keep the environment
+available.
+
 ## GitHub branch protection
 
 Protect `main` after the workflow has a successful run:
@@ -436,13 +510,13 @@ to run those jobs on pull requests. In the current workflow those jobs are
 | Celery/RabbitMQ asynchronous processing | Implemented |
 | OpenTelemetry integration | Implemented |
 | React/Vite dashboard | Implemented |
-| Local Docker Compose stack | Implemented |
+| Local Docker Compose stack | Implemented and verified |
 | Stream simulator and focused tests | Implemented |
 | Kubernetes manifests | Implemented |
 | Terraform baseline | Implemented, not applied |
 | GitHub Actions workflow | Implemented, requires account configuration |
 | GitHub repository publication | Complete |
-| AWS infrastructure deployment | Pending |
+| AWS infrastructure deployment | Not active; intentionally deferred for cost control |
 | EKS production rollout | Pending verification |
 | Branch protection | Pending configuration |
 
